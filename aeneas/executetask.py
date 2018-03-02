@@ -382,17 +382,32 @@ class ExecuteTask(Loggable):
         :param bool leaf_level: alert aba if the computation is at a leaf level
         :rtype: :class:`~aeneas.tree.Tree`
         """
-        self._step_begin(u"synthesize text", log=log)
-        synt_handler, synt_path, synt_anchors, synt_format = self._synthesize(text_file)
-        self._step_end(log=log)
+        if 'timings' in text_file.file_path:
+            self._step_begin(u"extract timings", log=log)
+            synt_path, synt_anchors, synt_format = self._provide_times(text_file)
+            self._step_end(log=log)
 
-        self._step_begin(u"extract MFCC synt wave", log=log)
-        synt_wave_mfcc = self._extract_mfcc(
-            file_path=synt_path,
-            file_format=synt_format,
-        )
-        gf.delete_file(synt_handler, synt_path)
-        self._step_end(log=log)
+            self._step_begin(u"extract MFCC synt wave", log=log)
+            synt_wave_mfcc = self._extract_mfcc(
+                file_path=synt_path,
+                file_format=synt_format,
+            )
+            # gf.delete_file(synt_handler, synt_path)
+            self._step_end(log=log)
+
+        else:
+            self._step_begin(u"synthesize text", log=log)
+            func = '_time_and_combine' if 'clips' in text_file.file_path else '_synthesize'
+            synt_handler, synt_path, synt_anchors, synt_format = getattr(self, func)(text_file)
+            self._step_end(log=log)
+
+            self._step_begin(u"extract MFCC synt wave", log=log)
+            synt_wave_mfcc = self._extract_mfcc(
+                file_path=synt_path,
+                file_format=synt_format,
+            )
+            gf.delete_file(synt_handler, synt_path)
+            self._step_end(log=log)
 
         self._step_begin(u"align waves", log=log)
         indices = self._align_waves(audio_file_mfcc, synt_wave_mfcc, synt_anchors)
@@ -401,6 +416,82 @@ class ExecuteTask(Loggable):
         self._step_begin(u"adjust boundaries", log=log)
         self._adjust_boundaries(indices, text_file, audio_file_mfcc, sync_root, force_aba_auto, leaf_level)
         self._step_end(log=log)
+
+    def _provide_times(self, text_file):
+        with open(text_file.file_path) as file:
+            timings = [row.strip().split(',') for row in file.readlines()]
+            synt_anchors = [[TimeValue(start), verse, file] for verse, start, file in timings]
+
+        synt_wav = timings[0][-1]
+        synt_format = ('pcm_s161e', 1, 2)
+        return synt_wav, synt_anchors, synt_format
+
+
+    def _time_and_combine(self, text_file):
+        """
+        Combine original audio clips into a single WAV file.
+
+        Return a tuple consisting of:
+
+        1. the handler of the generated audio file
+        2. the path of the generated audio file
+        3. the list of anchors, that is, a list of floats
+           each representing the start time of the corresponding
+           text fragment in the generated wave file
+           ``[start_1, start_2, ..., start_n]``
+        4. a tuple describing the format of the audio file
+
+        :param text_file: the text with audio clips to be timed/combined
+        :type  text_file: :class:`~aeneas.textfile.TextFile`
+        :rtype: tuple (handler, string, list)
+        """
+        import subprocess
+
+        # Concatenate all clips into a single, temporary file
+        handler, path = gf.tmp_file(suffix=u".wav", root=self.rconf[RuntimeConfiguration.TMP_PATH])
+        cmd = "ffmpeg -y -f concat -i {} -c copy {}".format(text_file.file_path, path)
+        subprocess.call(cmd, shell=True)
+
+        audio_format = ('pcm_s161e', 1, 2)
+
+        # Build "synt" anchor times
+        anchor_time, anchors = TimeValue('0.0'), []
+        for fragment in text_file.fragments:
+            audio_path = 'output/sample/{}'.format(fragment.text.split("'")[1])
+            audio_file = AudioFileMFCC(file_path=audio_path, file_format=audio_format)
+            # TODO: Investigate faster ways to get the audio_length
+            # cmd = 'ffprobe -i {} -show_entries format=duration -v quiet -of csv="p=0"'.format(audio_path)
+            # subprocess.call(cmd, shell=True)
+            # # should become... (to get response)
+            # cmds = ['ffprobe', '-i', audio_path, '-show_entries', 'format=duration',
+            #         '-v', 'quiet', '-of', 'csv="p=0"']
+            # p = subprocess.Popen(cmds, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            # output, err = p.communicate()
+            # audio_length = TimeValue(output)
+            anchors.append([anchor_time, fragment.identifier, audio_path])
+            anchor_time += audio_file.audio_length
+
+        # [
+        #     [TimeValue('0.0'), u'f000001', 'output/sample/audio01.wav'],
+        #     [TimeValue('0.339625'), u'f000002', 'output/sample/audio02.wav'],
+        #     [TimeValue('3.5526875'), u'f000003', 'output/sample/audio03.wav'],
+        #     [TimeValue('6.6874375'), u'f000004', 'output/sample/audio04.wav'],
+        #     [TimeValue('9.5609375'), u'f000005', 'output/sample/audio05.wav'],
+        #     [TimeValue('12.4344375'), u'f000006', 'output/sample/audio06.wav'],
+        #     [TimeValue('16.1961250'), u'f000007', 'output/sample/audio07.wav'],
+        #     [TimeValue('19.9578125'), u'f000008', 'output/sample/audio08.wav'],
+        #     [TimeValue('23.0925625'), u'f000009', 'output/sample/audio09.wav'],
+        #     [TimeValue('28.0297500'), u'f000010', 'output/sample/audio10.wav'],
+        #     [TimeValue('31.1645000'), u'f000011', 'output/sample/audio11.wav'],
+        #     [TimeValue('33.5678125'), u'f000012', 'output/sample/audio12.wav'],
+        #     [TimeValue('37.0943750'), u'f000013', 'output/sample/audio13.wav'],
+        #     [TimeValue('40.2030000'), u'f000014', 'output/sample/audio14.wav'],
+        #     [TimeValue('43.8601875'), u'f000015', 'output/sample/audio15.wav']
+        # ]
+
+        # import pdb; pdb.set_trace()
+
+        return (handler, path, anchors, audio_format)
 
     def _load_audio_file(self):
         """
